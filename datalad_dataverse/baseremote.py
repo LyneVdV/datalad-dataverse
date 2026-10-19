@@ -8,6 +8,7 @@ from pathlib import (
     PurePosixPath,
 )
 
+import httpx
 from requests.exceptions import HTTPError
 
 from datalad_next.annexremotes import (
@@ -111,17 +112,21 @@ class DataverseRemote(SpecialRemote):
         # if none is on record, proceed anonymously -- a token will
         # only be requested lazily, if/when the server actually
         # rejects an anonymous request (see _ensure_authenticated_api)
+        # (`obtain()` without a prompt never asks, and raises ValueError
+        # if nothing is known; unlike `get()`, it also finds a credential
+        # by realm when no credential name is configured)
         apitoken = None
+        cred = None
         try:
-            cred = credman.get(
+            credential_name, cred = credman.obtain(
                 name=credential_name if credential_name else None,
-                realm=credential_realm
+                type_hint='token',
+                expected_props=['secret'],
+                query_props={'realm': credential_realm},
             )
-            if cred:
-                apitoken = cred.get('secret')
-        except Exception:
-            cred = None
-            apitoken = None
+            apitoken = cred['secret']
+        except ValueError:
+            pass
 
         api = get_native_api(url, apitoken)
         try:
@@ -163,7 +168,16 @@ class DataverseRemote(SpecialRemote):
         apitoken = cred['secret']
         self._dvds._api = get_native_api(self._dataverse_url, apitoken)
         self._dvds._data_access_api = None
+        # an anonymous user does not see a DRAFT version, forget what
+        # was listed before
+        self._dvds._file_records = None
+        self._dvds._knows_all_versions = False
         self._credman.set(credential_name, _lastused=True, **cred)
+
+    def _ensure_write_access(self):
+        """Dataverse never permits modifications without an API token"""
+        if not self._dvds._api.api_token:
+            self._ensure_authenticated_api()
 
     def _with_auth_retry(self, func, *args, **kwargs):
         """
@@ -172,12 +186,15 @@ class DataverseRemote(SpecialRemote):
         """
         try:
             return func(*args, **kwargs)
-        except HTTPError as e:
-            if e.response is not None and e.response.status_code in (401, 403):
-                self._ensure_authenticated_api()
-                return func(*args, **kwargs)
-            raise
-    
+        except (ApiAuthorizationError, HTTPError, httpx.HTTPStatusError) as e:
+            response = getattr(e, 'response', None)
+            if self._dvds._api.api_token or not (
+                    isinstance(e, ApiAuthorizationError)
+                    or (response is not None
+                        and response.status_code in (401, 403))):
+                raise
+            self._ensure_authenticated_api()
+            return func(*args, **kwargs)
 
     def initremote(self):
         """
@@ -209,6 +226,7 @@ class DataverseRemote(SpecialRemote):
         return file_id is not None
 
     def transfer_store(self, key, local_file):
+        self._ensure_write_access()
         # If the remote path already exists, we need to replace rather than
         # upload the file, since otherwise dataverse would rename the file on
         # its end. However, this only concerns the latest version of the
@@ -236,9 +254,11 @@ class DataverseRemote(SpecialRemote):
             if file_id is None:
                 raise RemoteError(f"Key {key} unavailable")
 
-        self._download_file(file_id, file)
+        # e.g. a restricted file in a public dataset
+        self._with_auth_retry(self._download_file, file_id, file)
 
     def remove(self, key):
+        self._ensure_write_access()
         rm_ids = self._get_annex_fileid_record(key) \
             or [self._get_fileid_from_key(key, latest_only=True)]
         # the loop is only here because the tooling could handle

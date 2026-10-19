@@ -40,6 +40,7 @@ class DataverseRemote(ExportRemote, BaseDataverseRemote):
             return self._dvds.has_path_in_latest_version(remote_file)
 
     def transferexport_store(self, key, local_file, remote_file):
+        self._ensure_write_access()
         # If the remote path already exists, we need to replace rather than
         # upload the file, since otherwise dataverse would rename the file on
         # its end. However, this only concerns the latest version of the
@@ -73,6 +74,7 @@ class DataverseRemote(ExportRemote, BaseDataverseRemote):
         self._download_file(file_id, local_file)
 
     def removeexport(self, key, remote_file):
+        self._ensure_write_access()
         # For removal, path matching needs to be done, because we could have
         # several copies (dataverse IDs) of the content. Need to remove the one
         # that also matches the path.
@@ -87,6 +89,7 @@ class DataverseRemote(ExportRemote, BaseDataverseRemote):
         Otherwise annex calls removeexport + transferexport_store, which
         does not scale well performance-wise.
         """
+        self._ensure_write_access()
         # We cannot rely on ID lookup, since there could be several. We need to
         # match the path.
         rename_id = self._get_fileid_from_remotepath(
